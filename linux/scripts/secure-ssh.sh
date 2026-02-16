@@ -13,29 +13,39 @@ fi
 USERNAME=$1
 
 
-# Create user without password
+# Create user with home directory
 
 sudo useradd -m -s /bin/bash "$USERNAME"
-sudo passwd -d "$USERNAME"
 
-# Create .ssh directory for the user
+# Lock the Password
 
+sudo passwd -l "$USERNAME"
+
+# Create .ssh directory
+#
 sudo mkdir -p /home/$USERNAME/.ssh
+
+# Set ownership
+#
+
+sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
+#Set permissions
 sudo chmod 700 /home/$USERNAME/.ssh
 
-# copy the pub key from web01 user's authorized_key
+# Copy Public Key
+#
 
-sudo touch /home/$USERNAME/.ssh/authorized_keys
+sudo cp ~/SYS-265/linux/web01/id_rsa.pub /home/$USERNAME/.ssh/authorized_keys
+
+# Set public key permissions
+#
+
 sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
 
-# Set proper ownership
-sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
+# Set Ownership on auth keys
+#
+sudo chown $USERNAME:$USERNAME /home/$USERNAME/.ssh/authorized_keys
 
-echo "User $USERNAME was created."
-
-# Verify PermitRootLogin is disabled
-echo ""
-echo "Checking PermitLogin status:"
-grep -i "PermitRootLogin" /etc/ssh/sshd_config
+echo "User $USERNAME was created with SSH key authentication"
 
 
