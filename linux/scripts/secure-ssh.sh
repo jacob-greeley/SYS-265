@@ -16,6 +16,7 @@ USERNAME=$1
 # Create user without password
 
 sudo useradd -m -s /bin/bash "$USERNAME"
+udo passwd -d "$USERNAME"
 
 # Create .ssh directory for the user
 
