@@ -12,8 +12,7 @@
 ### Step 1 - Setup OUs (Deliverable 1)
 Run on AD01-jacob via remote PS session from MGMT01-jacob:
 ```powershell
-git clone https://github.com/YOUR_USERNAME/sys255-gpo-lab.git
-cd sys255-gpo-lab
+git clone https://github.com/jacob-greeley/SYS-265/tree/main/AD%20-%20GPO%20Lab
 .\1_setup_ou.ps1
 ```
 Screenshot the output for Deliverable 1.
