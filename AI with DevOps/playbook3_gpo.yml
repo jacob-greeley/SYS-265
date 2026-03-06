@@ -1,0 +1,206 @@
+---
+# =============================================================================
+# PLAYBOOK 3 OF 3 - AD DS GPO Hardening
+# =============================================================================
+# Author:   Jacob Greeley
+# Course:   SYS-255 / SEC-260  |  Champlain College
+# Domain:   jacob.local
+#
+# ELEMENTS COVERED:
+#   GPO 01 - Account Lockout Policy via AD Module  (Source: Group 01, Play 5)
+#   GPO 02 - PowerShell Script Block Logging       (Source: Group 04, Play 5)
+#
+# INVENTORY ASSUMPTIONS:
+#   [windows] group : ad01, mgmt01, wks01
+#   [rocky]   group : ansible01, ansible02  (not targeted in this playbook)
+#   hosts: ad01     : the Domain Controller - used exclusively in Play 1
+#
+# USAGE:
+#   Dry run : ansible-playbook playbook3_gpo.yml --check
+#   Apply   : ansible-playbook playbook3_gpo.yml
+#   Verbose : ansible-playbook playbook3_gpo.yml -vv
+#
+# NOTE (Play 1):
+#   Play 1 targets 'ad01' only - it modifies domain-wide policy via the
+#   Active Directory PowerShell module which must be run on the DC.
+#   Ensure the Ansible connection user has Domain Admin rights.
+# =============================================================================
+
+
+# =============================================================================
+# PLAY 1 | GPO Hardening 01 | AD01 - Account Lockout Policy
+# =============================================================================
+# WHY:
+#   Without an account lockout policy, password-spraying and brute-force
+#   attacks against AD accounts are completely unconstrained.  A single
+#   attacker script can try millions of passwords overnight.
+#   Set-ADDefaultDomainPasswordPolicy applies the lockout settings to the
+#   Default Domain Policy - identical to what GPMC would configure under
+#   Account Policies > Account Lockout Policy - but driven entirely through
+#   Ansible without opening a GUI or GPMC console.
+#
+# WHAT IT DOES:
+#   - LockoutThreshold 5          : locks the account after 5 failed attempts
+#   - LockoutDuration 00:30:00    : account stays locked for 30 minutes
+#   - LockoutObservationWindow    : resets the bad-attempt counter after 15 min
+#   A block / rescue wraps both the apply and verify tasks.  If anything
+#   inside 'block' fails (e.g., AD module unavailable, insufficient rights),
+#   the 'rescue' section runs and displays a helpful diagnostic message
+#   instead of leaving the play with an unclear error.
+#
+# KEY CONCEPTS:
+#   - block / rescue - Ansible's try / catch equivalent
+#   - win_shell with multi-line PowerShell (backtick line continuation)
+#   - Import-Module ActiveDirectory (pre-installed on Windows Server DC)
+#   - Set-ADDefaultDomainPasswordPolicy / Get-ADDefaultDomainPasswordPolicy
+#   - hosts: ad01 - targeting a single host from a larger group
+#   - changed_when: false on the verification read-back task
+#
+# HOSTS: ad01 (Domain Controller only)
+# =============================================================================
+- name: "PLAYBOOK 3 | GPO Hardening 01 | AD01 - Account Lockout Policy"
+  hosts: ad01       # This play must run on the DC - it sets domain-wide policy
+  gather_facts: false
+
+  tasks:
+
+    - name: "Apply and verify Account Lockout Policy via PowerShell AD module"
+      # block groups tasks together so that rescue catches any failure inside
+      block:
+
+        - name: "Set domain lockout policy with Set-ADDefaultDomainPasswordPolicy"
+          ansible.windows.win_shell: |
+            # The ActiveDirectory module ships with RSAT / AD DS on Windows Server
+            Import-Module ActiveDirectory
+
+            # Set-ADDefaultDomainPasswordPolicy writes directly to the Default
+            # Domain Policy - equivalent to GPMC > Default Domain Policy >
+            # Computer Configuration > Policies > Windows Settings >
+            # Security Settings > Account Policies > Account Lockout Policy
+            Set-ADDefaultDomainPasswordPolicy `
+              -Identity "jacob.local" `
+              -LockoutThreshold 5 `
+              -LockoutDuration "00:30:00" `
+              -LockoutObservationWindow "00:15:00"
+
+            Write-Output "Account lockout policy applied to jacob.local"
+          register: lockout_apply_result
+
+        - name: "Display policy application output"
+          ansible.builtin.debug:
+            var: lockout_apply_result.stdout_lines
+
+        - name: "Read back the policy to confirm values were written correctly"
+          ansible.windows.win_shell: |
+            Import-Module ActiveDirectory
+            $pol = Get-ADDefaultDomainPasswordPolicy -Identity "jacob.local"
+            # Format as clear key-value pairs for easy reading in debug output
+            "Threshold       : $($pol.LockoutThreshold) failed attempts"
+            "LockoutDuration : $($pol.LockoutDuration)"
+            "ObsrvWindow     : $($pol.LockoutObservationWindow)"
+          register:     lockout_verify_result
+          changed_when: false   # Read-only; verification does not change state
+
+        - name: "Display verified lockout policy values"
+          ansible.builtin.debug:
+            var: lockout_verify_result.stdout_lines
+
+      rescue:
+        # rescue only executes if one or more tasks inside block above fail.
+        # It provides a clear diagnostic rather than a raw Ansible error dump.
+        - name: "ERROR - Account lockout policy task failed"
+          ansible.builtin.debug:
+            msg: >
+              One or more lockout policy tasks failed on {{ inventory_hostname }}.
+              Check 1: Is the ActiveDirectory PowerShell module installed?
+              Check 2: Does the Ansible connection user have Domain Admin rights?
+              Check 3: Is WinRM reachable and authenticated on ad01?
+
+
+# =============================================================================
+# PLAY 2 | GPO Hardening 02 | Windows - PowerShell Script Block Logging
+# =============================================================================
+# WHY:
+#   PowerShell Script Block Logging records the decoded content of every
+#   PS script block executed on the system - including obfuscated payloads,
+#   in-memory attacks, and LOLBin abuse.  Events are written to the
+#   PowerShell Operational log (Event ID 4104 for script content,
+#   4105/4106 for invocation start/stop).  This is the single most
+#   valuable PowerShell logging control for threat hunting and forensics.
+#
+#   These registry values directly mirror the Group Policy path:
+#   Computer Configuration > Administrative Templates >
+#   Windows Components > Windows PowerShell >
+#   Turn on PowerShell Script Block Logging
+#
+# WHAT IT DOES:
+#   1. Ensures the ScriptBlockLogging registry key exists (it does NOT exist
+#      by default on a fresh Windows install - win_regedit creates it).
+#   2. Sets EnableScriptBlockLogging = 1     (logs all PS script content)
+#   3. Sets EnableScriptBlockInvocationLogging = 1 (logs start/stop events)
+#   4. Reads both values back to confirm they were written.
+#
+# KEY CONCEPTS:
+#   - win_regedit state: present on a path (creates key/folder, no value)
+#   - win_regedit with name + data + type (sets an actual value)
+#   - Registry key auto-creation - win_regedit creates missing parent keys
+#   - type: dword for policy enable/disable flags
+#   - Event IDs 4104 / 4105 / 4106 and where to find them in Event Viewer
+#   - changed_when: false on read-only win_shell verification
+#
+# HOSTS: ad01, mgmt01, wks01
+# =============================================================================
+- name: "PLAYBOOK 3 | GPO Hardening 02 | Windows - PS Script Block Logging"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Ensure the ScriptBlockLogging registry key path exists"
+      ansible.windows.win_regedit:
+        # This key path does not exist by default on Windows.
+        # Providing only 'path' with state: present tells win_regedit to
+        # create the key (registry folder) without setting any value inside it.
+        # win_regedit also auto-creates any missing parent keys in the path.
+        path:  'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        state: present
+
+    - name: "Enable Script Block Logging (log all executed PS script content)"
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        name: EnableScriptBlockLogging
+        data: 1       # 1 = Enabled  |  0 = Disabled
+        type: dword
+        # When enabled, every executed PS script block is written to:
+        # Event Viewer > Applications and Services Logs >
+        # Microsoft > Windows > PowerShell > Operational  (Event ID 4104)
+
+    - name: "Enable Invocation Logging (log PS script start and stop events)"
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+        name: EnableScriptBlockInvocationLogging
+        data: 1       # 1 = Log invocation start (Event ID 4105) and stop (4106)
+        type: dword
+
+    - name: "Verify both Script Block Logging registry values"
+      ansible.windows.win_shell: |
+        $path  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+        $props = Get-ItemProperty $path -ErrorAction SilentlyContinue
+        if ($props) {
+          "EnableScriptBlockLogging           : $($props.EnableScriptBlockLogging) (1 = enabled)"
+          "EnableScriptBlockInvocationLogging : $($props.EnableScriptBlockInvocationLogging) (1 = enabled)"
+          "Log path: Event Viewer > Microsoft > Windows > PowerShell > Operational"
+        } else {
+          "ERROR: Registry key not found - check the tasks above for failures."
+        }
+      register:     sbl_verify_result
+      changed_when: false   # Read-only verification; no system state changed
+
+    - name: "Display Script Block Logging verification output"
+      ansible.builtin.debug:
+        var: sbl_verify_result.stdout_lines
+
+# =============================================================================
+# END OF PLAYBOOK 3 - AD DS GPO Hardening
+# END OF ALL 3 SELECTED LABS PLAYBOOKS
+# =============================================================================

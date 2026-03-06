@@ -1,0 +1,196 @@
+---
+# =============================================================================
+# PLAYBOOK 2 OF 3 - System Hardening
+# =============================================================================
+# Author:   Jacob Greeley
+# Course:   SYS-255 / SEC-260  |  Champlain College
+# Domain:   jacob.local
+#
+# ELEMENTS COVERED:
+#   Hardening 01 - SSH Daemon Hardening (Rocky)         (Source: Group 03, Play 3)
+#   Hardening 02 - Disable AutoRun / AutoPlay (Windows) (Source: Group 05, Play 4)
+#
+# INVENTORY ASSUMPTIONS:
+#   [windows] group : ad01, mgmt01, wks01
+#   [rocky]   group : ansible01, ansible02
+#
+# USAGE:
+#   Dry run : ansible-playbook playbook2_hardening.yml --check
+#   Apply   : ansible-playbook playbook2_hardening.yml
+#   Verbose : ansible-playbook playbook2_hardening.yml -vv
+#
+# SAFETY NOTE (Play 1):
+#   Confirm you have SSH key-based access to the Rocky hosts BEFORE applying.
+#   PasswordAuthentication is intentionally left enabled in this lab build
+#   so you cannot accidentally lock yourself out.
+# =============================================================================
+
+
+# =============================================================================
+# PLAY 1 | Hardening 01 | Rocky - SSH Daemon Hardening
+# =============================================================================
+# WHY:
+#   SSH is the primary remote access surface on Linux servers.  The default
+#   sshd_config ships with settings that violate CIS Benchmark for RHEL/Rocky:
+#   root login is permitted, there is no brute-force throttle, and idle
+#   sessions are never terminated.  This play closes four of the most
+#   commonly flagged SSH findings in security audits without breaking
+#   legitimate access.
+#
+# WHAT IT DOES:
+#   - PermitRootLogin no      : blocks direct root SSH sessions
+#   - MaxAuthTries 4          : slows brute-force by limiting auth attempts
+#   - PermitEmptyPasswords no : prevents login with blank passwords
+#   - ClientAliveInterval 600 : disconnects idle sessions after 10 minutes
+#   Each lineinfile task creates a .bak backup and notifies the 'Restart sshd'
+#   handler.  Handlers fire ONCE at the end of the play, no matter how many
+#   tasks notify them - preventing multiple unnecessary service restarts.
+#   A sshd -t syntax check runs BEFORE the handler fires, so a typo in a
+#   lineinfile value will fail the play safely rather than breaking sshd.
+#
+# KEY CONCEPTS:
+#   - lineinfile module with regexp (match commented or uncommented lines)
+#   - notify / handler pattern (handler fires once regardless of notify count)
+#   - backup: yes (creates .bak - good habit before editing system configs)
+#   - sshd -t syntax validation with failed_when for safety
+#   - changed_when: false on read-only command tasks
+#
+# HOSTS: ansible01, ansible02
+# =============================================================================
+- name: "PLAYBOOK 2 | Hardening 01 | Rocky - SSH Daemon Hardening"
+  hosts: rocky
+  become: true
+
+  handlers:
+    # Handlers are defined here and only triggered when a task uses 'notify'.
+    # Even if four tasks all notify this handler, it runs exactly once -
+    # at the very end of the play, after all tasks have completed.
+    - name: Restart sshd
+      ansible.builtin.service:
+        name:  sshd
+        state: restarted
+
+  tasks:
+
+    - name: "Disable direct root login via SSH"
+      ansible.builtin.lineinfile:
+        path:   /etc/ssh/sshd_config
+        # regexp matches whether the directive is commented out (#PermitRootLogin)
+        # or already present (PermitRootLogin yes) - handles both cases cleanly
+        regexp: '^#?PermitRootLogin'
+        line:   'PermitRootLogin no'
+        backup: yes   # Saves /etc/ssh/sshd_config.bak before the first change
+      notify: Restart sshd
+
+    - name: "Limit SSH authentication attempts to 4 (reduce brute-force window)"
+      ansible.builtin.lineinfile:
+        path:   /etc/ssh/sshd_config
+        regexp: '^#?MaxAuthTries'
+        line:   'MaxAuthTries 4'
+        backup: yes
+      notify: Restart sshd
+
+    - name: "Prohibit login with empty or blank passwords"
+      ansible.builtin.lineinfile:
+        path:   /etc/ssh/sshd_config
+        regexp: '^#?PermitEmptyPasswords'
+        line:   'PermitEmptyPasswords no'
+        backup: yes
+      notify: Restart sshd
+
+    - name: "Set SSH idle timeout to 600 seconds (10 minutes)"
+      ansible.builtin.lineinfile:
+        path:   /etc/ssh/sshd_config
+        regexp: '^#?ClientAliveInterval'
+        line:   'ClientAliveInterval 600'
+        backup: yes
+      notify: Restart sshd
+
+    - name: "Validate sshd_config syntax BEFORE the handler restarts sshd"
+      ansible.builtin.command: sshd -t
+      register:     sshd_syntax_check
+      changed_when: false
+      # If sshd -t returns a non-zero exit code the config has a syntax error.
+      # Failing here prevents the handler from restarting sshd with a broken
+      # config, which would lock everyone out of the host.
+      failed_when:  sshd_syntax_check.rc != 0
+
+    - name: "Confirm sshd_config syntax is valid"
+      ansible.builtin.debug:
+        msg: "sshd_config syntax validated OK on {{ inventory_hostname }}"
+
+
+# =============================================================================
+# PLAY 2 | Hardening 02 | Windows - Disable AutoRun and AutoPlay
+# =============================================================================
+# WHY:
+#   AutoRun/AutoPlay silently executes code from USB drives and removable
+#   media when they are inserted - a classic physical attack vector used in
+#   USB-drop campaigns (e.g., Stuxnet, Conficker, and countless red-team
+#   exercises).  Disabling it via registry mirrors what a GPO would enforce
+#   and applies across all drive types using a bitmask value.
+#
+# WHAT IT DOES:
+#   - NoDriveTypeAutoRun = 255 (0xFF) : disables AutoRun on ALL drive types
+#     (removable, fixed, network, CD-ROM, RAM disk, and unknown).
+#   - NoAutoplayfornonVolume = 1      : disables AutoPlay for non-volume
+#     devices such as cameras and smartphones.
+#   - DisableAutoplay = 1             : disables AutoPlay for the current
+#     user profile (HKCU).
+#   A win_shell verification task reads the primary HKLM value back to
+#   confirm it was written correctly.
+#
+# KEY CONCEPTS:
+#   - win_regedit module (create / update registry keys and values)
+#   - type: dword (32-bit unsigned integer - most policy values use this)
+#   - HKLM vs HKCU registry hives and their scope difference
+#   - Bitmask registry values (255 = 0xFF = all bits set = all drive types)
+#   - win_shell verification with changed_when: false
+#
+# HOSTS: ad01, mgmt01, wks01
+# =============================================================================
+- name: "PLAYBOOK 2 | Hardening 02 | Windows - Disable AutoRun and AutoPlay"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable AutoRun for ALL drive types via registry bitmask"
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+        name: NoDriveTypeAutoRun
+        # 255 decimal = 0xFF hex = all 8 drive-type bits set
+        # Covers: unknown, no-root-dir, removable, fixed, network, CD-ROM, RAM disk
+        data: 255
+        type: dword   # DWORD = 32-bit unsigned integer registry value type
+
+    - name: "Disable AutoPlay for non-volume devices (cameras, phones, etc.)"
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'
+        name: NoAutoplayfornonVolume
+        data: 1   # 1 = Disabled  |  0 = Enabled (default)
+        type: dword
+
+    - name: "Disable AutoPlay entirely for the current user profile"
+      ansible.windows.win_regedit:
+        # HKCU scope applies to the user account Ansible connects as
+        path: 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers'
+        name: DisableAutoplay
+        data: 1   # 1 = Disabled
+        type: dword
+
+    - name: "Verify primary AutoRun registry value was applied"
+      ansible.windows.win_shell: |
+        $pol = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        $val = (Get-ItemProperty $pol -ErrorAction SilentlyContinue).NoDriveTypeAutoRun
+        "NoDriveTypeAutoRun on {{ inventory_hostname }}: $val (expected: 255 = all drives blocked)"
+      register:     autorun_verify_result
+      changed_when: false   # Read-only; no system state changed
+
+    - name: "Display AutoRun verification result"
+      ansible.builtin.debug:
+        var: autorun_verify_result.stdout_lines
+
+# =============================================================================
+# END OF PLAYBOOK 2 - System Hardening
+# =============================================================================

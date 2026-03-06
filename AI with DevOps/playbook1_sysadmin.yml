@@ -1,0 +1,172 @@
+---
+# =============================================================================
+# PLAYBOOK 1 OF 3 - System Administration
+# =============================================================================
+# Author:   Jacob Greeley
+# Course:   SYS-255 / SEC-260  |  Champlain College
+# Domain:   jacob.local
+#
+# ELEMENTS COVERED:
+#   SysAdmin 01 - Expand Windows Event Log Sizes     (Source: Group 04, Play 2)
+#   SysAdmin 02 - Create Ops User on Rocky Linux     (Source: Group 02, Play 1)
+#
+# INVENTORY ASSUMPTIONS:
+#   [windows] group : ad01, mgmt01, wks01
+#   [rocky]   group : ansible01, ansible02
+#
+# USAGE:
+#   Dry run : ansible-playbook playbook1_sysadmin.yml --check
+#   Apply   : ansible-playbook playbook1_sysadmin.yml
+#   Verbose : ansible-playbook playbook1_sysadmin.yml -vv
+# =============================================================================
+
+
+# =============================================================================
+# PLAY 1 | SysAdmin 01 | Windows - Expand Event Log Maximum Sizes
+# =============================================================================
+# WHY:
+#   Default Windows event logs are capped at only 20 MB. On a busy Domain
+#   Controller the Security log can fill and overwrite within hours, erasing
+#   forensic evidence. Expanding the logs to 1 GB (Security) and 500 MB
+#   (System / Application) directly supports incident response and aligns
+#   with NIST 800-53 AU-11 (Audit Record Retention).
+#
+# WHAT IT DOES:
+#   Loops over three log names and calls wevtutil sl (set-log) with the /ms:
+#   (maxsize) parameter on each Windows host.  A second win_shell task reads
+#   the config back with wevtutil gl (get-log) to confirm the new values.
+#   changed_when: false is applied to the read-back task because it performs
+#   no system changes.
+#
+# KEY CONCEPTS:
+#   - win_shell module
+#   - loop with a list of dicts
+#   - loop_control label (clean Ansible output)
+#   - register + changed_when: false (idempotent verification)
+#   - wevtutil.exe (Windows built-in log management tool)
+#
+# HOSTS: ad01, mgmt01, wks01
+# =============================================================================
+- name: "PLAYBOOK 1 | SysAdmin 01 | Windows - Expand Event Log Sizes"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    # Each entry pairs a log name with its new maximum size in bytes.
+    # 1 073 741 824 bytes = 1 GB  |  524 288 000 bytes = 500 MB
+    event_logs:
+      - name: "Security"
+        max_size: 1073741824    # 1 GB - Security log needs the most room
+      - name: "System"
+        max_size: 524288000     # 500 MB
+      - name: "Application"
+        max_size: 524288000     # 500 MB
+
+  tasks:
+
+    - name: "Set maximum size for each Windows Event Log"
+      ansible.windows.win_shell: |
+        # wevtutil sl  = set-log
+        # /ms:<bytes>  = maxsize parameter
+        wevtutil sl "{{ item.name }}" /ms:{{ item.max_size }}
+        Write-Output "{{ item.name }} log max size set to {{ item.max_size }} bytes."
+      loop: "{{ event_logs }}"
+      register: log_resize_result
+      # loop_control label replaces the default dict dump in Ansible output,
+      # making it easy to see which log each iteration is acting on
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Verify event log sizes were applied correctly"
+      ansible.windows.win_shell: |
+        # wevtutil gl = get-log; reads back the current log configuration
+        $logs = @("Security", "System", "Application")
+        foreach ($log in $logs) {
+          $info = wevtutil gl $log | Select-String "maxSize"
+          "$log : $info"
+        }
+      register: log_verify_result
+      # This task is purely read-only - marking it changed_when: false keeps
+      # Ansible's change count accurate and idempotency reporting clean
+      changed_when: false
+
+    - name: "Display event log size verification output"
+      ansible.builtin.debug:
+        var: log_verify_result.stdout_lines
+
+
+# =============================================================================
+# PLAY 2 | SysAdmin 02 | Rocky - Create Standard Ops User
+# =============================================================================
+# WHY:
+#   Running automation or admin tasks as root is unnecessarily risky.
+#   A dedicated 'ansibleops' account with wheel group membership provides a
+#   consistent, auditable identity for managed operations across all Rocky
+#   servers.  This pattern follows CIS Benchmark L1 guidance for Linux
+#   (avoid direct root use; use sudo escalation instead).
+#
+# WHAT IT DOES:
+#   1. Creates the 'ansibleops' group (group module).
+#   2. Creates the 'ansibleops' user in that group with a home directory
+#      (user module, create_home: true).
+#   3. Adds the user to 'wheel' using append: true - critical because
+#      append: false (the default) would REPLACE all existing groups with
+#      just 'wheel', potentially breaking other memberships.
+#   4. Verifies creation by running 'id ansibleops' and displaying the result.
+#
+# KEY CONCEPTS:
+#   - group module (create before the user that depends on it)
+#   - user module with create_home
+#   - append: true vs append: false - a common gotcha
+#   - become: true for privilege escalation
+#   - idempotency: re-running shows 'ok', not 'changed'
+#   - register + command module for read-only verification
+#
+# HOSTS: ansible01, ansible02
+# =============================================================================
+- name: "PLAYBOOK 1 | SysAdmin 02 | Rocky - Create Ops User"
+  hosts: rocky
+  become: true   # All user/group management requires root privileges
+
+  vars:
+    ops_user:    "ansibleops"
+    ops_group:   "ansibleops"
+    ops_shell:   "/bin/bash"
+    ops_comment: "Ansible Ops Account - jacob.local Lab"
+
+  tasks:
+
+    - name: "Ensure the ops group exists before creating the user"
+      ansible.builtin.group:
+        name:  "{{ ops_group }}"
+        state: present   # Creates the group if absent; no-op if already there
+
+    - name: "Create the ops user account"
+      ansible.builtin.user:
+        name:        "{{ ops_user }}"
+        group:       "{{ ops_group }}"    # Primary group
+        shell:       "{{ ops_shell }}"
+        comment:     "{{ ops_comment }}"  # GECOS / description field
+        state:       present
+        create_home: true                 # Creates /home/ansibleops if missing
+
+    - name: "Add ops user to 'wheel' group for sudo privileges"
+      ansible.builtin.user:
+        name:   "{{ ops_user }}"
+        groups: wheel
+        # CRITICAL: append: true ADDS wheel to existing groups.
+        # append: false would REPLACE all groups with just 'wheel' - avoid!
+        append: true
+
+    - name: "Verify the user exists and display UID / GID info"
+      ansible.builtin.command: "id {{ ops_user }}"
+      register:     user_id_output
+      changed_when: false   # 'id' is read-only; not a real system change
+
+    - name: "Display ops user identity information"
+      ansible.builtin.debug:
+        var: user_id_output.stdout
+
+# =============================================================================
+# END OF PLAYBOOK 1 - System Administration
+# =============================================================================
